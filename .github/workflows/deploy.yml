@@ -25,11 +25,12 @@ jobs:
           username: ${{ secrets.FTP_USERNAME }}
           password: ${{ secrets.FTP_PASSWORD }}
           port: ${{ secrets.FTP_PORT }}
+          parallel: 1
           protocol: ftp
           local-dir: ./
-          server-dir: ./
-          state-name: socialshop-deploy-v1
-          log-level: standard
+          server-dir: /public_html/
+          state-name: socialshop-deploy-v2
+          log-level: minimal
           exclude: |
             **/.git*
             **/.github/**
