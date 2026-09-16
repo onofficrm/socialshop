@@ -13,15 +13,13 @@ concurrency:
 jobs:
   malware-cleanup-and-deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install lftp
-        run: sudo apt-get update && sudo apt-get install -y lftp
-
-      - name: Scan and remove malware via FTP
+      - name: Purge malware and verify via FTP
         env:
           FTP_SERVER: ${{ secrets.FTP_SERVER }}
           FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
@@ -29,196 +27,198 @@ jobs:
           FTP_PORT: ${{ secrets.FTP_PORT }}
         run: |
           set -euo pipefail
-          cat > /tmp/ftp-clean.py <<'PY'
+          python3 <<'PY'
           import ftplib
           import os
-          import sys
-          from typing import List, Tuple
+          import time
+          from typing import List, Set, Tuple
 
           host = os.environ["FTP_SERVER"]
           user = os.environ["FTP_USERNAME"]
           password = os.environ["FTP_PASSWORD"]
           port = int(os.environ.get("FTP_PORT") or "21")
 
-          # Exact / partial names reported by host + common webshells
-          NAME_HITS = {
-              "moc.php",
-              "zor",
-              "zor.php",
-              "wso.php",
-              "c99.php",
-              "r57.php",
-              "shell.php",
-              "cmd.php",
-              "alfa.php",
-              "alfa3.php",
-              "byp.php",
-              "up.php",
-              "upload.php",
-              "xx.php",
-              "x.php",
-              "1.php",
-              "2.php",
-              "a.php",
-              "wp-login.php",
-              "xmlrpc.php",
+          SKIP_DIRS = {
+              ".", "..", "mail", "logs", "etc", "ssl", "cgi-bin",
+              ".spamassassin", ".cl.selector", ".cagefs", "softaculous",
           }
-          NAME_CONTAINS = ("moc", "zor", "webshell", "c99", "r57", "wso", "alfa", "b374k")
 
-          roots = ["/", "/public_html", "/www", "/httpdocs", "/home"]
           deleted: List[str] = []
-          scanned: List[str] = []
-          suspicious: List[str] = []
+          remaining: List[str] = []
+          errors: List[str] = []
 
           def connect() -> ftplib.FTP:
               ftp = ftplib.FTP()
               ftp.connect(host, port, timeout=60)
               ftp.login(user, password)
               ftp.set_pasv(True)
+              ftp.encoding = "latin-1"
               return ftp
 
-          def list_entries(ftp: ftplib.FTP, path: str) -> List[Tuple[str, bool]]:
-              entries: List[Tuple[str, bool]] = []
+          def list_dir(ftp: ftplib.FTP, path: str) -> List[Tuple[str, bool]]:
+              out: List[Tuple[str, bool]] = []
               try:
                   ftp.cwd(path)
-              except Exception:
-                  return entries
+              except Exception as e:
+                  errors.append(f"cwd {path}: {e}")
+                  return out
+              # Prefer MLSD
               try:
                   for name, facts in ftp.mlsd():
                       if name in (".", ".."):
                           continue
-                      is_dir = facts.get("type") == "dir"
-                      entries.append((name, is_dir))
-                  return entries
+                      out.append((name, facts.get("type") == "dir"))
+                  return out
               except Exception:
                   pass
-              # fallback NLST
+              # LIST parse
+              lines: List[str] = []
               try:
-                  names = ftp.nlst()
-              except Exception:
-                  return entries
-              for raw in names:
-                  name = raw.split("/")[-1]
+                  ftp.retrlines("LIST", lines.append)
+              except Exception as e:
+                  errors.append(f"list {path}: {e}")
+                  return out
+              for line in lines:
+                  parts = line.split(maxsplit=8)
+                  if len(parts) < 9:
+                      continue
+                  name = parts[8]
                   if name in (".", ".."):
                       continue
-                  # probe directory
-                  is_dir = False
-                  cur = ftp.pwd()
-                  try:
-                      ftp.cwd(name)
-                      ftp.cwd(cur)
-                      is_dir = True
-                  except Exception:
-                      is_dir = False
-                  entries.append((name, is_dir))
-              return entries
+                  is_dir = line.startswith("d")
+                  out.append((name, is_dir))
+              return out
 
-          def should_delete(name: str, is_dir: bool) -> bool:
+          def is_malware(name: str, is_dir: bool) -> bool:
               lower = name.lower()
-              if lower in NAME_HITS or name in NAME_HITS:
+              # Host reported these specifically
+              if lower in {"moc.php", "zor", "zor.php"}:
                   return True
-              if any(x in lower for x in NAME_CONTAINS):
+              if "moc" in lower or "zor" in lower:
                   return True
-              # This site is static HTML only — any PHP under web roots is suspicious
-              if (not is_dir) and lower.endswith(".php"):
+              # Common webshell / dropper patterns
+              needles = (
+                  "webshell", "c99", "r57", "wso", "alfa", "b374k", "byp",
+                  "shell", "cmd", "wp-login.php", "xmlrpc.php",
+              )
+              if any(n in lower for n in needles):
                   return True
-              if (not is_dir) and lower.endswith((".phtml", ".phar", ".php5", ".php7", ".suspected")):
+              if not is_dir and lower.endswith((
+                  ".php", ".phtml", ".phar", ".php5", ".php7", ".suspected",
+                  ".php.bak", ".php.old", ".php~",
+              )):
+                  return True
+              # hidden php-like
+              if not is_dir and lower.startswith(".") and "php" in lower:
                   return True
               return False
 
-          def rm_tree(ftp: ftplib.FTP, path: str) -> None:
-              # path is absolute or cwd-relative full path we tracked
+          def delete_file(ftp: ftplib.FTP, path: str, name: str) -> bool:
+              full = path.rstrip("/") + "/" + name
               try:
                   ftp.cwd(path)
-              except Exception:
-                  # maybe file
-                  try:
-                      ftp.delete(path)
-                      deleted.append(path)
-                  except Exception as e:
-                      print(f"FAIL delete file {path}: {e}")
-                  return
-              for name, is_dir in list_entries(ftp, path):
+                  ftp.delete(name)
+                  deleted.append(full)
+                  print(f"DELETED file {full}", flush=True)
+                  return True
+              except Exception as e:
+                  errors.append(f"delete {full}: {e}")
+                  print(f"FAIL delete {full}: {e}", flush=True)
+                  return False
+
+          def delete_tree(ftp: ftplib.FTP, path: str) -> None:
+              for name, is_dir in list_dir(ftp, path):
                   child = path.rstrip("/") + "/" + name
                   if is_dir:
-                      rm_tree(ftp, child)
+                      delete_tree(ftp, child)
                   else:
-                      try:
-                          ftp.delete(child)
-                          deleted.append(child)
-                          print(f"DELETED file {child}")
-                      except Exception as e:
-                          print(f"FAIL delete file {child}: {e}")
-              # remove directory itself (except web roots)
-              if path.rstrip("/") not in ("", "/public_html", "/www", "/httpdocs", "/home"):
-                  parent = "/".join(path.rstrip("/").split("/")[:-1]) or "/"
-                  base = path.rstrip("/").split("/")[-1]
-                  try:
-                      ftp.cwd(parent)
-                      ftp.rmd(base)
-                      deleted.append(path + "/")
-                      print(f"DELETED dir {path}/")
-                  except Exception as e:
-                      print(f"FAIL rmdir {path}: {e}")
-
-          def walk(ftp: ftplib.FTP, path: str, depth: int = 0) -> None:
-              if depth > 12:
+                      delete_file(ftp, path, name)
+              parent = "/".join(path.rstrip("/").split("/")[:-1]) or "/"
+              base = path.rstrip("/").split("/")[-1]
+              if not base:
                   return
-              scanned.append(path)
-              for name, is_dir in list_entries(ftp, path):
+              try:
+                  ftp.cwd(parent)
+                  ftp.rmd(base)
+                  deleted.append(path + "/")
+                  print(f"DELETED dir {path}/", flush=True)
+              except Exception as e:
+                  errors.append(f"rmd {path}: {e}")
+                  print(f"FAIL rmd {path}: {e}", flush=True)
+
+          def walk(ftp: ftplib.FTP, path: str, depth: int, purge: bool) -> None:
+              if depth > 18:
+                  return
+              for name, is_dir in list_dir(ftp, path):
+                  if name in SKIP_DIRS:
+                      continue
                   child = path.rstrip("/") + "/" + name
-                  if should_delete(name, is_dir):
-                      suspicious.append(child + ("/" if is_dir else ""))
-                      print(f"HIT {child}{'/' if is_dir else ''}")
-                      if is_dir:
-                          rm_tree(ftp, child)
+                  hit = is_malware(name, is_dir)
+                  if hit:
+                      print(f"HIT {'dir' if is_dir else 'file'} {child}", flush=True)
+                      if purge:
+                          if is_dir:
+                              delete_tree(ftp, child)
+                          else:
+                              delete_file(ftp, path, name)
                       else:
-                          try:
-                              # delete relative to parent
-                              parent = path
-                              ftp.cwd(parent)
-                              ftp.delete(name)
-                              deleted.append(child)
-                              print(f"DELETED file {child}")
-                          except Exception as e:
-                              print(f"FAIL delete {child}: {e}")
+                          remaining.append(child + ("/" if is_dir else ""))
                       continue
                   if is_dir:
-                      # skip heavy/system dirs
-                      if name.lower() in ("mail", "logs", "tmp", "etc", "ssl", "cgi-bin"):
-                          continue
-                      walk(ftp, child, depth + 1)
+                      walk(ftp, child, depth + 1, purge)
 
           ftp = connect()
-          print(f"Connected to {host}:{port} as {user}")
-          print(f"PWD={ftp.pwd()}")
-          # Discover usable roots from login home
           home = ftp.pwd()
-          candidates = [home, home.rstrip("/") + "/public_html", "/public_html", "/www"]
-          seen = set()
-          for root in candidates:
-              key = root.rstrip("/") or "/"
-              if key in seen:
-                  continue
-              seen.add(key)
+          print(f"Connected {host}:{port} user={user} home={home}", flush=True)
+
+          roots: List[str] = []
+          for r in [home, "/public_html", "/www", "/httpdocs",
+                    home.rstrip("/") + "/public_html",
+                    home.rstrip("/") + "/www"]:
+              if r and r not in roots:
+                  roots.append(r)
+
+          print("=== PASS 1: purge ===", flush=True)
+          for root in roots:
+              print(f"SCAN {root}", flush=True)
               try:
                   ftp.cwd(root)
-                  print(f"SCAN root {root}")
-                  walk(ftp, root if root.startswith("/") else ftp.pwd())
               except Exception as e:
-                  print(f"SKIP root {root}: {e}")
+                  print(f"SKIP {root}: {e}", flush=True)
+                  continue
+              walk(ftp, root, 0, purge=True)
 
-          print("--- SUMMARY ---")
-          print(f"scanned_dirs={len(scanned)}")
-          print(f"hits={len(suspicious)}")
-          for s in suspicious:
-              print(f"  hit: {s}")
-          print(f"deleted={len(deleted)}")
+          # Second pass after short pause
+          time.sleep(2)
+          print("=== PASS 2: verify ===", flush=True)
+          remaining.clear()
+          for root in roots:
+              try:
+                  ftp.cwd(root)
+              except Exception:
+                  continue
+              walk(ftp, root, 0, purge=False)
+
+          print("--- SUMMARY ---", flush=True)
+          print(f"deleted={len(deleted)}", flush=True)
           for d in deleted:
-              print(f"  del: {d}")
+              print(f"  del: {d}", flush=True)
+          print(f"remaining_hits={len(remaining)}", flush=True)
+          for r in remaining:
+              print(f"  remain: {r}", flush=True)
+          if errors:
+              print(f"errors={len(errors)}", flush=True)
+              for e in errors[:50]:
+                  print(f"  err: {e}", flush=True)
+
           ftp.quit()
+
+          # Fail if host-reported names still present
+          critical = [r for r in remaining if "moc" in r.lower() or "zor" in r.lower() or r.lower().endswith(".php") or r.lower().endswith("/")]
+          if critical:
+              raise SystemExit(f"Malware still present after purge: {critical[:20]}")
+          print("VERIFY OK: no moc/zor/php malware hits in FTP tree", flush=True)
           PY
-          python3 /tmp/ftp-clean.py
 
       - name: Clean-slate deploy static site
         uses: SamKirkland/FTP-Deploy-Action@v4.3.5
@@ -232,7 +232,7 @@ jobs:
           local-dir: ./
           server-dir: /public_html/
           dangerous-clean-slate: true
-          state-name: socialshop-deploy-v3-clean
+          state-name: socialshop-deploy-v4-purge
           log-level: standard
           exclude: |
             **/.git*
