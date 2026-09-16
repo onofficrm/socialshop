@@ -41,7 +41,8 @@ jobs:
           protocol: ftp
           local-dir: ./webapp/dist/
           server-dir: /public_html/
-          state-name: socialshop-deploy-v5-spa
+          dangerous-clean-slate: true
+          state-name: socialshop-deploy-v6-spa-clean
           log-level: standard
           exclude: |
             **/.DS_Store
